@@ -1,0 +1,11 @@
+# NIKDY necommitovat hesla a tokeny
+.streamlit/secrets.toml
+
+# lokální cache nahraných dat — do repa ji zrcadlí appka přes GitHub API,
+# ručně ji commitovat nechceme (jinak by se do gitu dostala citlivá data omylem)
+data_cache/
+
+# python smetí
+__pycache__/
+*.pyc
+.DS_Store

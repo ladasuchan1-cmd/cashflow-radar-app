@@ -1,0 +1,15 @@
+[server]
+# Vypne kontrolu XSRF a CORS, které na Streamlit Cloud občas shazovaly websocket
+enableXsrfProtection = false
+enableCORS = false
+maxUploadSize = 400
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#ef7c00"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#faf7f2"
+textColor = "#2b2b2b"
+font = "sans serif"
