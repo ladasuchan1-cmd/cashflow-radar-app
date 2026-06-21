@@ -1407,9 +1407,9 @@ def _uloz_upload(uploaded_file, cilovy_nazev: str) -> Path | None:
     cesta = _cache_dir() / cilovy_nazev
     with open(cesta, "wb") as f:
         f.write(uploaded_file.getbuffer())
-    # Zrcadli do GitHub repa, ať data přežijí uspání appky na Streamlit Cloud
+    # Zrcadli do Supabase, ať data přežijí uspání appky na Streamlit Cloud
     if _persist is not None:
-        _persist.gh_push_file(cesta)
+        _persist.push_file(cesta)
     return cesta
 
 
@@ -2750,9 +2750,9 @@ def main() -> None:
     if not _zkontroluj_heslo():
         return
 
-    # Po studeném startu stáhni poslední uložená data z GitHub repa do cache
+    # Po studeném startu stáhni poslední uložená data ze Supabase do cache
     if _persist is not None:
-        _persist.gh_pull_once(_cache_dir())
+        _persist.pull_once(_cache_dir())
 
     uvodni_obrazovka()
 

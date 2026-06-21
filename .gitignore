@@ -1,8 +1,8 @@
 # NIKDY necommitovat hesla a tokeny
 .streamlit/secrets.toml
 
-# lokální cache nahraných dat — do repa ji zrcadlí appka přes GitHub API,
-# ručně ji commitovat nechceme (jinak by se do gitu dostala citlivá data omylem)
+# lokální cache nahraných dat — trvale se zrcadlí do Supabase, NE do repa.
+# Repo je veřejné, takže faktury sem nesmí (proto ignorujeme).
 data_cache/
 
 # python smetí
