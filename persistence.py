@@ -1,138 +1,188 @@
 """
-persistence.py — trvalé uložení nahraných dat pro Cashflow Radar
-přes Supabase Storage (zdarma, privátní úložiště).
+persistence.py — synchronizace cache souborů se Supabase Storage.
 
-PROČ
-----
-Streamlit Cloud nemá trvalý disk: po uspání / redeployi se složka `data_cache/`
-smaže. Aby "poslední nahraná data zůstala až do dalšího nahrání", zrcadlíme
-`data_cache/` do PRIVÁTNÍHO Supabase bucketu. Díky tomu může být GitHub repo
-appky VEŘEJNÉ (jen kód) — žádné faktury v repu → žádný limit privátních appek.
+Slouží k tomu, aby poslední nahraná data přežila uspání aplikace na
+Streamlit Community Cloud (kde se lokální složka data_cache/ po čase smaže).
 
-Klíč k Supabase je v st.secrets (NE v repu), takže veřejné repo nic neprozradí.
+Hlavní aplikace (cashflow_radar.py) volá:
+    persistence.push_file(cesta)     — po uložení souboru do cache
+    persistence.pull_once(cache_dir) — jednou po startu, stáhne data zpět
 
-POUŽITÍ (volá se z cashflow_radar.py)
--------------------------------------
-  pull_once(cache_dir)     # 1× na začátku session — stáhne data z bucketu
-  push_file(local_path)    # po každém uložení souboru — pošle ho do bucketu
+Konfigurace přes Streamlit secrets (.streamlit/secrets.toml nebo cloud Secrets):
+    [supabase]
+    url = "https://abcxyz.supabase.co"
+    service_key = "eyJ...dlouhý service_role klíč..."
+    bucket = "data"          # volitelné, výchozí 'data'
+    prefix = "cashflow"      # volitelné, podsložka v bucketu
 
-Když není v st.secrets sekce [supabase], všechny funkce jsou no-op (appka jede
-dál jen s lokální cache — typicky lokální běh na PC).
+Pokud secrets chybí nebo je něco špatně, všechny funkce jsou no-op
+(jen tiše nic neudělají) a aplikace běží dál jen s lokální cache.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import streamlit as st
-
 try:
     import requests
 except Exception:  # noqa: BLE001
     requests = None
 
+try:
+    import streamlit as st
+except Exception:  # noqa: BLE001
+    st = None
 
-def _conf():
-    """Vrátí (url, key, bucket) nebo None, když Supabase není nakonfigurovaný."""
-    if requests is None:
+
+# Soubory, které se synchronizují (názvy v cache složce)
+_SYNC_FILES = [
+    "faktury.xlsx",
+    "prijemky.xlsx",
+    "pohyby.xlsx",
+    "pohyby_historicke.xlsx",
+    "stav.xlsx",
+    "prijemky_polozkove.xlsx",
+    "prijemky_polozkove.pdf",
+    "prijemky_polozkove_nove.xlsx",
+    "prijemky_polozkove_nove.pdf",
+]
+
+
+def _config() -> dict | None:
+    """Načte konfiguraci Supabase ze streamlit secrets. None = vypnuto."""
+    if st is None or requests is None:
         return None
     try:
-        s = st.secrets.get("supabase", {})
-    except Exception:  # noqa: BLE001 — st.secrets nemusí existovat lokálně
-        return None
-    url, key = s.get("url"), s.get("key")
-    bucket = s.get("bucket", "radar-data")
-    if not (url and key):
-        return None
-    return url.rstrip("/"), key, bucket
-
-
-def _headers(key: str) -> dict:
-    return {"apikey": key, "Authorization": f"Bearer {key}"}
-
-
-def _ensure_bucket(url: str, key: str, bucket: str) -> None:
-    """Vytvoří privátní bucket, pokud ještě neexistuje (ignoruje 'už existuje')."""
-    try:
-        requests.post(
-            f"{url}/storage/v1/bucket",
-            headers={**_headers(key), "Content-Type": "application/json"},
-            json={"name": bucket, "id": bucket, "public": False},
-            timeout=15,
-        )
+        if "supabase" not in st.secrets:
+            return None
+        cfg = st.secrets["supabase"]
+        url = str(cfg.get("url", "")).rstrip("/")
+        key = str(cfg.get("service_key", ""))
+        if not url or not key:
+            return None
+        return {
+            "url": url,
+            "key": key,
+            "bucket": str(cfg.get("bucket", "data")),
+            "prefix": str(cfg.get("prefix", "cashflow")).strip("/"),
+        }
     except Exception:  # noqa: BLE001
-        pass
+        return None
 
 
-def push_file(local_path: Path) -> None:
-    """Nahraje jeden soubor z data_cache/ do Supabase bucketu (vytvoří/přepíše)."""
-    conf = _conf()
-    if conf is None:
-        return
-    url, key, bucket = conf
-    local_path = Path(local_path)
-    if not local_path.exists():
-        return
-    _ensure_bucket(url, key, bucket)
-    data = local_path.read_bytes()
+def _object_path(cfg: dict, filename: str) -> str:
+    """Sestaví cestu objektu v bucketu (s volitelným prefixem)."""
+    if cfg["prefix"]:
+        return f"{cfg['prefix']}/{filename}"
+    return filename
+
+
+def _headers(cfg: dict, content_type: str | None = None) -> dict:
+    h = {
+        "Authorization": f"Bearer {cfg['key']}",
+        "apikey": cfg["key"],
+    }
+    if content_type:
+        h["Content-Type"] = content_type
+    return h
+
+
+def push_file(cesta) -> bool:
+    """
+    Nahraje (nebo přepíše) jeden soubor z cache do Supabase Storage.
+    Vrací True při úspěchu, jinak False. Při vypnuté konfiguraci tiše vrátí False.
+    """
+    cfg = _config()
+    if cfg is None:
+        return False
+
+    cesta = Path(cesta)
+    if not cesta.exists():
+        return False
+
+    filename = cesta.name
+    obj = _object_path(cfg, filename)
+    # upsert=true → přepíše existující objekt
+    endpoint = f"{cfg['url']}/storage/v1/object/{cfg['bucket']}/{obj}"
+
     try:
-        # x-upsert: true → přepíše, pokud už soubor existuje
-        r = requests.post(
-            f"{url}/storage/v1/object/{bucket}/{local_path.name}",
-            headers={**_headers(key),
-                     "Content-Type": "application/octet-stream",
+        with open(cesta, "rb") as f:
+            data = f.read()
+        resp = requests.post(
+            endpoint,
+            headers={**_headers(cfg, "application/octet-stream"),
                      "x-upsert": "true"},
             data=data,
-            timeout=60,
+            timeout=30,
         )
-        if r.status_code >= 400:
-            st.sidebar.warning(
-                f"Uložení {local_path.name} do Supabase selhalo ({r.status_code}).")
+        if resp.status_code in (200, 201):
+            return True
+        # Tiché varování do UI (neshazuje appku)
+        if st is not None:
+            st.warning(
+                f"Uložení {filename} do Supabase selhalo "
+                f"({resp.status_code}).")
+        return False
     except Exception as e:  # noqa: BLE001
-        st.sidebar.warning(f"Supabase nedostupné: {e}")
+        if st is not None:
+            st.warning(f"Uložení {filename} do Supabase selhalo: {e}")
+        return False
 
 
-def pull_once(cache_dir: Path) -> None:
-    """1× za session stáhne soubory z bucketu do lokální cache.
-    Stahuje jen soubory, které lokálně chybí (po studeném startu)."""
-    if st.session_state.get("_sb_pulled"):
-        return
-    st.session_state["_sb_pulled"] = True
+def _download_file(cfg: dict, filename: str, cilova_cesta: Path) -> bool:
+    """Stáhne jeden objekt z bucketu do cílové cesty. True při úspěchu."""
+    obj = _object_path(cfg, filename)
+    endpoint = f"{cfg['url']}/storage/v1/object/{cfg['bucket']}/{obj}"
+    try:
+        resp = requests.get(endpoint, headers=_headers(cfg), timeout=30)
+        if resp.status_code == 200 and resp.content:
+            with open(cilova_cesta, "wb") as f:
+                f.write(resp.content)
+            return True
+        return False  # 404 = soubor v bucketu není, to je v pořádku
+    except Exception:  # noqa: BLE001
+        return False
 
-    conf = _conf()
-    if conf is None:
-        return
-    url, key, bucket = conf
+
+def pull_once(cache_dir) -> int:
+    """
+    Jednou po startu aplikace stáhne všechny synchronizované soubory
+    ze Supabase do lokální cache (pokud tam ještě nejsou).
+
+    Vrací počet stažených souborů. Při vypnuté konfiguraci vrátí 0.
+    Používá streamlit session_state, aby se stahování dělalo jen jednou
+    za běh session (ne při každém rerunu).
+    """
+    cfg = _config()
+    if cfg is None:
+        return 0
+
+    # Stáhni jen jednou za session
+    if st is not None:
+        if st.session_state.get("_supabase_pulled", False):
+            return 0
+        st.session_state["_supabase_pulled"] = True
+
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(exist_ok=True)
 
-    # 1) Seznam souborů v bucketu
-    try:
-        r = requests.post(
-            f"{url}/storage/v1/object/list/{bucket}",
-            headers={**_headers(key), "Content-Type": "application/json"},
-            json={"prefix": "", "limit": 100,
-                  "sortBy": {"column": "name", "order": "asc"}},
-            timeout=30,
-        )
-        if r.status_code >= 400:
-            return
-        soubory = [o["name"] for o in r.json() if o.get("name")]
-    except Exception:  # noqa: BLE001
-        return
+    stazeno = 0
+    for filename in _SYNC_FILES:
+        cil = cache_dir / filename
+        # Pokud už lokálně existuje (čerstvě nahrané), nepřepisuj ze Supabase
+        if cil.exists():
+            continue
+        if _download_file(cfg, filename, cil):
+            stazeno += 1
 
-    # 2) Stáhni ty, co lokálně chybí
-    for nazev in soubory:
-        lokal = cache_dir / Path(nazev).name
-        if lokal.exists():
-            continue  # lokální (čerstvější) verzi nepřepisujeme
-        try:
-            rr = requests.get(
-                f"{url}/storage/v1/object/{bucket}/{nazev}",
-                headers=_headers(key),
-                timeout=120,
-            )
-            if rr.status_code < 400 and rr.content:
-                lokal.write_bytes(rr.content)
-        except Exception:  # noqa: BLE001
-            pass
+    return stazeno
+
+
+def status() -> str:
+    """Vrátí čitelný stav konfigurace (pro diagnostiku v UI)."""
+    cfg = _config()
+    if cfg is None:
+        if requests is None:
+            return "⚠️ Chybí knihovna requests"
+        return "ℹ️ Supabase není nakonfigurováno (běží jen lokální cache)"
+    return f"✅ Supabase připojeno (bucket '{cfg['bucket']}', prefix '{cfg['prefix']}')"
